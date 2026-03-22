@@ -1,93 +1,124 @@
-from pathlib import Path
-import shutil
+import os
+import sys
 import uuid
-
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import subprocess
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-TEMP_DIR = BASE_DIR / "temp"
+app = FastAPI()
 
-for folder in [UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR]:
-    folder.mkdir(parents=True, exist_ok=True)
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "."))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", DATA_ROOT / "uploads"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", DATA_ROOT / "outputs"))
 
-app = FastAPI(title="StemDroid API", version="0.1.0")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+jobs = {}
 
 @app.get("/")
 def root():
-    return {"message": "StemDroid backend is running"}
+    return {"status": "stem separation server running"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/upload")
-async def upload_audio(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-
-    allowed = {".mp3", ".wav", ".flac", ".m4a"}
-    suffix = Path(file.filename).suffix.lower()
-
-    if suffix not in allowed:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix}")
-
+async def upload_file(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
-    saved_name = f"{job_id}{suffix}"
-    saved_path = UPLOAD_DIR / saved_name
+    original_name = Path(file.filename).name
+    file_path = UPLOAD_DIR / f"{job_id}_{original_name}"
 
-    with saved_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
 
-    return {
+    jobs[job_id] = {
         "job_id": job_id,
-        "original_filename": file.filename,
-        "saved_filename": saved_name,
-        "saved_path": str(saved_path),
-        "next_step": f"/separate/{job_id}"
+        "status": "uploaded",
+        "message": "File uploaded",
+        "file": str(file_path),
+        "stems": []
     }
+
+    return {"job_id": job_id, "status": "uploaded"}
 
 @app.post("/separate/{job_id}")
-def separate_stub(job_id: str):
-    fake_output_dir = OUTPUT_DIR / job_id
-    fake_output_dir.mkdir(parents=True, exist_ok=True)
+def separate(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
 
-    stems = ["vocals.wav", "drums.wav", "bass.wav", "other.wav"]
-    for stem in stems:
-        stem_path = fake_output_dir / stem
-        if not stem_path.exists():
-            stem_path.write_bytes(b"")
+    input_file = Path(jobs[job_id]["file"])
+    output_folder = OUTPUT_DIR / job_id
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "job_id": job_id,
-        "status": "completed_stub",
-        "message": "Stub separation complete. Real model hookup comes next.",
-        "stems": [f"/download/{job_id}/{stem}" for stem in stems]
-    }
+    command = [
+        sys.executable,
+        "-m",
+        "demucs",
+        "--two-stems=vocals",
+        "-o",
+        str(output_folder),
+        str(input_file)
+    ]
 
-@app.get("/download/{job_id}/{filename}")
-def download_file(job_id: str, filename: str):
-    file_path = OUTPUT_DIR / job_id / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, filename=filename)
+    try:
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["message"] = "Separation in progress"
+        jobs[job_id]["stems"] = []
+
+        subprocess.run(command, check=True)
+
+        track_stem_dir = output_folder / "htdemucs" / input_file.stem
+
+        stem_paths = []
+        if track_stem_dir.exists():
+            for stem_file in sorted(track_stem_dir.glob("*.wav")):
+                stem_paths.append(str(stem_file))
+
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["message"] = "Separation completed"
+        jobs[job_id]["stems"] = stem_paths
+
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "output": str(output_folder)
+        }
+
+    except subprocess.CalledProcessError as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["message"] = f"Separation failed: {e}"
+        jobs[job_id]["stems"] = []
+
+        return {
+            "job_id": job_id,
+            "status": "failed"
+        }
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    job_dir = OUTPUT_DIR / job_id
-    if not job_dir.exists():
-        return JSONResponse(status_code=404, content={"detail": "Job not found"})
+    if job_id not in jobs:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    return jobs[job_id]
 
-    files = sorted([p.name for p in job_dir.iterdir() if p.is_file()])
-    return {"job_id": job_id, "files": files}
+@app.get("/download/{job_id}/{stem_file_name}")
+def download_stem(job_id: str, stem_file_name: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    stem_paths = jobs[job_id].get("stems", [])
+    if not stem_paths:
+        raise HTTPException(status_code=404, detail="no stems available for this job")
+
+    for stem_path in stem_paths:
+        path_obj = Path(stem_path)
+        if path_obj.name == stem_file_name and path_obj.exists():
+            return FileResponse(
+                path=str(path_obj),
+                filename=path_obj.name,
+                media_type="audio/wav"
+            )
+
+    raise HTTPException(status_code=404, detail="stem file not found")
