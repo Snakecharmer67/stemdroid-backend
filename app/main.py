@@ -17,13 +17,16 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 jobs = {}
 
+
 @app.get("/")
 def root():
     return {"status": "stem separation server running"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -42,7 +45,11 @@ async def upload_file(file: UploadFile = File(...)):
         "stems": []
     }
 
-    return {"job_id": job_id, "status": "uploaded"}
+    return {
+        "job_id": job_id,
+        "status": "uploaded"
+    }
+
 
 @app.post("/separate/{job_id}")
 def separate(job_id: str):
@@ -57,6 +64,8 @@ def separate(job_id: str):
         sys.executable,
         "-m",
         "demucs",
+        "-n",
+        "mdx_extra_q",
         "--two-stems=vocals",
         "-o",
         str(output_folder),
@@ -68,9 +77,18 @@ def separate(job_id: str):
         jobs[job_id]["message"] = "Separation in progress"
         jobs[job_id]["stems"] = []
 
-        subprocess.run(command, check=True)
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True
+        )
 
-        track_stem_dir = output_folder / "htdemucs" / input_file.stem
+        track_stem_dir = output_folder / "mdx_extra_q" / input_file.stem
+        if not track_stem_dir.exists():
+            fallback_dir = output_folder / "htdemucs" / input_file.stem
+            if fallback_dir.exists():
+                track_stem_dir = fallback_dir
 
         stem_paths = []
         if track_stem_dir.exists():
@@ -84,7 +102,9 @@ def separate(job_id: str):
         return {
             "job_id": job_id,
             "status": "completed",
-            "output": str(output_folder)
+            "output": str(output_folder),
+            "stdout": completed.stdout[-1000:],
+            "stderr": completed.stderr[-1000:]
         }
 
     except subprocess.CalledProcessError as e:
@@ -92,16 +112,24 @@ def separate(job_id: str):
         jobs[job_id]["message"] = f"Separation failed: {e}"
         jobs[job_id]["stems"] = []
 
-        return {
-            "job_id": job_id,
-            "status": "failed"
-        }
+        return JSONResponse(
+            status_code=500,
+            content={
+                "job_id": job_id,
+                "status": "failed",
+                "message": str(e),
+                "stdout": (e.stdout or "")[-1000:],
+                "stderr": (e.stderr or "")[-1000:]
+            }
+        )
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     if job_id not in jobs:
         return JSONResponse(status_code=404, content={"error": "job not found"})
     return jobs[job_id]
+
 
 @app.get("/download/{job_id}/{stem_file_name}")
 def download_stem(job_id: str, stem_file_name: str):
