@@ -3,3 +3,5 @@ uvicorn==0.39.0
 python-multipart==0.0.20
 demucs==4.0.1
 soundfile==0.13.1
+opencv-python-headless
+numpy
